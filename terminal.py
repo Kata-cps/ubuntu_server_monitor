@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Display Ubuntu Monitor metrics in a terminal."""
 import argparse
+import json
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -94,6 +96,25 @@ def network():
             'send': max(0, sent - previous[1]) / elapsed}
 
 
+def ip_addresses():
+    """List IPv4 and IPv6 addresses on non-loopback interfaces."""
+    try:
+        result = subprocess.run(['ip', '-j', 'address', 'show'], capture_output=True,
+                                text=True, timeout=3, check=True)
+        interfaces = json.loads(result.stdout)
+        addresses = []
+        for interface in interfaces:
+            name = interface.get('ifname', '?')
+            if name == 'lo' or 'LOOPBACK' in interface.get('flags', []):
+                continue
+            for address in interface.get('addr_info', []):
+                if address.get('family') in ('inet', 'inet6') and address.get('scope') == 'global' and address.get('local'):
+                    addresses.append((name, address['local']))
+        return addresses
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError):
+        return []
+
+
 def top_processes():
     try:
         result = subprocess.run(['ps', '-eo', 'pid=,pcpu=,pmem=,comm=', '--sort=-pcpu'],
@@ -109,6 +130,24 @@ def top_processes():
         return []
 
 
+def system_specs():
+    """Collect basic static specs without requiring external packages."""
+    os_info = {}
+    for line in (read('/etc/os-release') or '').splitlines():
+        key, sep, value = line.partition('=')
+        if sep:
+            os_info[key] = value.strip().strip('"').strip("'")
+    cpu_info = {}
+    for line in (read('/proc/cpuinfo') or '').splitlines():
+        key, sep, value = line.partition(':')
+        if sep and key.strip() not in cpu_info:
+            cpu_info[key.strip()] = value.strip()
+    cpu_name = cpu_info.get('model name') or cpu_info.get('Hardware') or cpu_info.get('Processor')
+    return {'os': os_info.get('PRETTY_NAME') or '取得できません',
+            'kernel': platform.release(), 'architecture': platform.machine(),
+            'cpu': cpu_name or '取得できません'}
+
+
 def metrics():
     disk = shutil.disk_usage('/')
     uptime = read('/proc/uptime')
@@ -116,7 +155,7 @@ def metrics():
         load = list(os.getloadavg())
     except (OSError, AttributeError):
         load = None
-    return {'hostname': socket.gethostname(), 'timestamp': time.time(), 'cpu_percent': cpu(), 'cpu_count': os.cpu_count(), 'memory': memory(), 'disk': {'used': disk.used, 'total': disk.total, 'percent': round(disk.used / disk.total * 100, 1)}, 'uptime': float(uptime.split()[0]) if uptime else None, 'load': load, 'gpu': gpu(), 'network': network(), 'processes': top_processes()}
+    return {'hostname': socket.gethostname(), 'timestamp': time.time(), 'cpu_percent': cpu(), 'cpu_count': os.cpu_count(), 'memory': memory(), 'disk': {'used': disk.used, 'total': disk.total, 'percent': round(disk.used / disk.total * 100, 1)}, 'uptime': float(uptime.split()[0]) if uptime else None, 'load': load, 'gpu': gpu(), 'network': network(), 'addresses': ip_addresses(), 'processes': top_processes()}
 
 
 
@@ -128,7 +167,7 @@ def size(value):
     return f'{value / (1024 ** 3):.1f} GiB'
 
 
-def render(data):
+def render(data, specs=None):
     width = max(20, min(shutil.get_terminal_size((72, 24)).columns, 72))
     use_color = sys.stdout.isatty() and os.environ.get('TERM') != 'dumb' and 'NO_COLOR' not in os.environ
     encoding = sys.stdout.encoding or 'utf-8'
@@ -167,8 +206,13 @@ def render(data):
         f"  {color(dot, '32')}  {color(data['hostname'], '1')}  {color('/  LIVE', '32')}",
         color(f'     最終更新  {stamp}', '90'),
         '',
-        color('  SYSTEM  /  システム', '1;34'),
     ]
+    if specs:
+        lines += [color('  SPECS  /  スペック', '1;34'),
+                  f"  OS   {specs['os']}  ({specs['architecture']})",
+                  f"  CPU  {specs['cpu']}",
+                  f"  Kernel  {specs['kernel']}", '',
+                  color('  SYSTEM  /  システム', '1;34')]
     lines += meter('CPU', data['cpu_percent'], f"{data['cpu_count'] or '?'} 論理 CPU")
     for key, name in [('memory', 'メモリ'), ('disk', 'ディスク /')]:
         item = data[key]
@@ -196,6 +240,12 @@ def render(data):
         temp = f"{card['temperature']:.0f} °C" if card['temperature'] is not None else '取得できません'
         lines.append(f'  温度  {temp}')
     lines += ['', color('  NETWORK  /  通信速度', '1;34')]
+    addresses = data.get('addresses', [])
+    if addresses:
+        for interface, address in addresses:
+            lines.append(f'  IP  {interface}  {address}')
+    else:
+        lines.append('  IP  取得できません')
     net = data.get('network')
     def rate(value):
         for unit in ('B/s', 'KiB/s', 'MiB/s', 'GiB/s'):
@@ -226,6 +276,7 @@ def main():
     args = parser.parse_args()
     if not 0.1 <= args.interval <= 3600:
         parser.error('--interval は 0.1〜3600 秒の範囲で指定してください')
+    specs = system_specs()
     cpu()
     network()
     time.sleep(0.2)  # CPU の使用率を差分から求めるための最初の測定間隔
@@ -234,7 +285,7 @@ def main():
             data = metrics()
             if sys.stdout.isatty() and not args.once:
                 print('\033[H\033[2J', end='')
-            print(render(data), flush=True)
+            print(render(data, specs), flush=True)
             if args.once:
                 break
             print(f'  更新間隔 {args.interval:g}秒  ·  終了 Ctrl+C', flush=True)
